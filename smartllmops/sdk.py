@@ -3,7 +3,8 @@ import time
 import functools
 import inspect
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from .streamlit_patch import patch_streamlit
 from contextvars import ContextVar
 
 
@@ -98,6 +99,10 @@ class SDKTracer:
         self.model = model or "unknown"
         self.provider = provider or "unknown"
         self.framework = framework
+        try:
+            patch_streamlit(self)
+        except Exception:
+            pass
         self.enrichers = {
             "llm": self._enrich_llm,
             "retrieval": self._enrich_retrieval,
@@ -1018,6 +1023,22 @@ class SDKTracer:
         # Log trace first
         self.telemetry.log_trace(trace)
 
+        # Automatically store trace_id in Streamlit session state if running inside Streamlit
+        try:
+            import streamlit as st
+            if "_smartllmops_traces" not in st.session_state:
+                st.session_state._smartllmops_traces = []
+            
+            # Avoid duplicate trace entries
+            if not any(t.get("trace_id") == trace_id for t in st.session_state._smartllmops_traces):
+                st.session_state._smartllmops_traces.append({
+                    "trace_id": trace_id,
+                    "session_id": session_id,
+                    "user_id": user_id
+                })
+        except Exception:
+            pass
+
         # Cleanup Registry ONLY after successful logging to prevent memory leaks (MANDATORY)
         if session_id:
             with _global_lock:
@@ -1027,6 +1048,38 @@ class SDKTracer:
                 _global_in_flight_spans.pop(trace_id, None)
 
         return trace
+
+    def log_feedback(
+        self,
+        trace_id: str,
+        thumb: Optional[str] = None,
+        retry_clicked: Optional[bool] = None,
+        output_copied: Optional[bool] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None
+    ):
+        """
+        Public telemetry method to submit user feedback parameters (thumb, retry, copy).
+        Works asynchronously and decoupled in any Python LLM application (FastAPI, Flask, etc.).
+        """
+        try:
+            feedback_doc = {
+                "id": f"feedback-{trace_id}",
+                "trace_id": trace_id,
+                "session_id": session_id or "session-unknown",
+                "user_id": user_id or "user-unknown",
+                "thumb": thumb,
+                "retry_clicked": retry_clicked,
+                "output_copied": output_copied,
+                "type": "feedback",
+                "timestamp": int(time.time() * 1000),
+                "partitionKey": trace_id
+            }
+            self.telemetry.log_trace(feedback_doc)
+            return True
+        except Exception as e:
+            print(f"smartllmops: Failed to log feedback: {e}")
+            return False
 
     # ---------------------------------------------------------
     # AUTO-INSTRUMENTATION (LangSmith-style)
