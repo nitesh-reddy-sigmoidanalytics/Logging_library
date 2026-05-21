@@ -16,6 +16,7 @@ class Telemetry:
 
         self.client = None
         self.container = None
+        self.feedback_container = None
         self.queue = queue.Queue()
         self.stop_event = threading.Event()
 
@@ -25,6 +26,7 @@ class Telemetry:
                 self.client = CosmosClient.from_connection_string(self.cosmos_conn)
                 db = self.client.get_database_client(self.db_name)
                 self.container = db.get_container_client(self.container_name)
+                self.feedback_container = db.get_container_client("user_feedback")
                 print("Cosmos telemetry initialized (Async mode)")
             except Exception as e:
                 print(f"Cosmos initialization failed: {e}")
@@ -53,7 +55,18 @@ class Telemetry:
                     continue
 
                 try:
-                    self.container.upsert_item(body=trace)
+                    if trace.get("type") == "feedback" and self.feedback_container:
+                        from azure.cosmos.exceptions import CosmosResourceNotFoundError
+                        try:
+                            existing = self.feedback_container.read_item(item=trace["id"], partition_key=trace["id"])
+                            for k, v in trace.items():
+                                if v is not None:
+                                    existing[k] = v
+                            self.feedback_container.upsert_item(body=existing)
+                        except CosmosResourceNotFoundError:
+                            self.feedback_container.upsert_item(body=trace)
+                    else:
+                        self.container.upsert_item(body=trace)
                 except Exception as e:
                     print(f"Cosmos logging failed, using fallback: {e}")
                     self._write_fallback(trace)
@@ -86,7 +99,18 @@ class Telemetry:
                 if not line.strip(): continue
                 trace = json.loads(line)
                 try:
-                    self.container.upsert_item(body=trace)
+                    if trace.get("type") == "feedback" and self.feedback_container:
+                        from azure.cosmos.exceptions import CosmosResourceNotFoundError
+                        try:
+                            existing = self.feedback_container.read_item(item=trace["id"], partition_key=trace["id"])
+                            for k, v in trace.items():
+                                if v is not None:
+                                    existing[k] = v
+                            self.feedback_container.upsert_item(body=existing)
+                        except CosmosResourceNotFoundError:
+                            self.feedback_container.upsert_item(body=trace)
+                    else:
+                        self.container.upsert_item(body=trace)
                 except:
                     remaining_traces.append(trace)
             
@@ -120,7 +144,7 @@ class Telemetry:
         """Add trace to async queue for processing."""
         try:
             # Ensure ID exists
-            if "trace_id" in trace:
+            if "id" not in trace and "trace_id" in trace:
                 trace["id"] = trace["trace_id"]
 
             # Ensure partition key
