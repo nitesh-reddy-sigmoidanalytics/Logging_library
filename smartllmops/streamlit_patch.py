@@ -58,36 +58,127 @@ def patch_streamlit(tracer):
                         except Exception:
                             pass
 
-                    # small horizontal row for interactions
-                    col1, col2, col3, col4, col5 = st.columns([0.08, 0.08, 0.15, 0.15, 0.54])
-                    with col1:
-                        if st.button("👍", key=f"smart_up_{tid}_{idx}"):
-                            send_feedback(thumb="up")
-                            st.toast("Feedback sent! Thank you.")
-                    with col2:
-                        if st.button("👎", key=f"smart_down_{tid}_{idx}"):
-                            send_feedback(thumb="down")
-                            st.toast("Feedback sent! Thank you.")
-                    with col3:
-                        if st.button("📋 Copy", key=f"smart_copy_{tid}_{idx}"):
-                            send_feedback(output_copied=True)
-                            st.toast("Copy event tracked!")
-                    with col4:
-                        if st.button("🔄 Retry", key=f"smart_retry_{tid}_{idx}"):
-                            send_feedback(retry_clicked=True)
-                            st.toast("Retry tracked!")
-                            
-                            # Find the matching preceding user prompt in st.session_state.messages
-                            if "messages" in st.session_state and isinstance(st.session_state.messages, list):
-                                assis_count = 0
-                                for m_idx, msg in enumerate(st.session_state.messages):
-                                    if msg.get("role") == "assistant":
-                                        if assis_count == idx:
-                                            if m_idx > 0 and st.session_state.messages[m_idx - 1].get("role") == "user":
-                                                st.session_state.retry_prompt = st.session_state.messages[m_idx - 1]["content"]
-                                                st.rerun()
-                                            break
-                                        assis_count += 1
+                    # Inject hidden metadata so that the Javascript event auto-capture can associate events with the trace
+                    st.markdown(
+                        f'<div class="smartllmops-meta" data-trace-id="{tid}" data-session-id="{session_id}" data-user-id="{user_id}" style="display:none;"></div>',
+                        unsafe_allow_html=True
+                    )
+
+                    # Inject the global JS auto-capture script if not already injected
+                    if not st.session_state.get("_smartllmops_js_injected"):
+                        st.components.v1.html(
+                            """
+                            <script>
+                            (function() {
+                                if (window.parent._smartllmops_autocapture_initialized) return;
+                                window.parent._smartllmops_autocapture_initialized = true;
+
+                                console.log("✅ SmartLLMOps: Client-side event auto-capture activated.");
+
+                                function findMetaValue(container, attr) {
+                                    if (!container) return null;
+                                    const meta = container.querySelector('.smartllmops-meta');
+                                    return meta ? meta.getAttribute(attr) : null;
+                                }
+
+                                function getTelemetryEndpoint() {
+                                    return window.parent.SMART_LLMOPS_BACKEND_URL || "http://localhost:8000/feedback";
+                                }
+
+                                function sendFeedbackPayload(payload) {
+                                    const url = getTelemetryEndpoint();
+                                    window.parent.fetch(url, {
+                                        method: 'POST',
+                                        headers: {
+                                            'Content-Type': 'application/json'
+                                        },
+                                        body: JSON.stringify(payload)
+                                    })
+                                    .then(res => {
+                                        if (!res.ok) console.warn("SmartLLMOps: Failed to send feedback to backend:", res.statusText);
+                                    })
+                                    .catch(err => {
+                                        console.error("SmartLLMOps: Feedback transmission error:", err);
+                                    });
+                                }
+
+                                // 1. Capture copy events
+                                window.parent.document.addEventListener('copy', function(e) {
+                                    const selection = window.parent.getSelection();
+                                    if (!selection || selection.toString().trim() === "") return;
+                                    
+                                    let anchor = selection.anchorNode;
+                                    if (anchor && anchor.nodeType === Node.TEXT_NODE) {
+                                        anchor = anchor.parentNode;
+                                    }
+                                    
+                                    const chatMessage = anchor.closest('[data-testid="stChatMessage"]');
+                                    if (chatMessage) {
+                                        const traceId = findMetaValue(chatMessage, 'data-trace-id');
+                                        if (traceId) {
+                                            const sessionId = findMetaValue(chatMessage, 'data-session-id') || "session-unknown";
+                                            const userId = findMetaValue(chatMessage, 'data-user-id') || "user-unknown";
+                                            
+                                            sendFeedbackPayload({
+                                                trace_id: traceId,
+                                                session_id: sessionId,
+                                                user_id: userId,
+                                                output_copied: true
+                                            });
+                                            console.log(`SmartLLMOps: Tracked COPY for trace ${traceId}`);
+                                        }
+                                    }
+                                });
+
+                                // 2. Capture click events (Thumbs Up, Thumbs Down, Copy, Retry)
+                                window.parent.document.addEventListener('click', function(e) {
+                                    const target = e.target;
+                                    if (!target) return;
+
+                                    const chatMessage = target.closest('[data-testid="stChatMessage"]');
+                                    if (!chatMessage) return;
+
+                                    const traceId = findMetaValue(chatMessage, 'data-trace-id');
+                                    if (!traceId) return;
+
+                                    const sessionId = findMetaValue(chatMessage, 'data-session-id') || "session-unknown";
+                                    const userId = findMetaValue(chatMessage, 'data-user-id') || "user-unknown";
+
+                                    const text = (target.innerText || target.value || "").trim().toLowerCase();
+                                    
+                                    let thumb = null;
+                                    let retryClicked = null;
+                                    let outputCopied = null;
+
+                                    if (text.includes("👍") || text === "up" || text.includes("thumbs-up") || target.classList.contains("thumb-up") || target.id.includes("thumb-up")) {
+                                        thumb = "up";
+                                    } else if (text.includes("👎") || text === "down" || text.includes("thumbs-down") || target.classList.contains("thumb-down") || target.id.includes("thumb-down")) {
+                                        thumb = "down";
+                                    } else if (text.includes("copy") || text.includes("📋") || target.classList.contains("copy-btn") || target.id.includes("copy")) {
+                                        outputCopied = true;
+                                    } else if (text.includes("retry") || text.includes("🔄") || target.classList.contains("retry-btn") || target.id.includes("retry")) {
+                                        retryClicked = true;
+                                    }
+
+                                    if (thumb || retryClicked || outputCopied) {
+                                        sendFeedbackPayload({
+                                            trace_id: traceId,
+                                            session_id: sessionId,
+                                            user_id: userId,
+                                            thumb: thumb,
+                                            retry_clicked: retryClicked,
+                                            output_copied: outputCopied
+                                        });
+                                        console.log(`SmartLLMOps: Tracked click event for trace ${traceId}: thumb=${thumb}, retry=${retryClicked}, copy=${outputCopied}`);
+                                    }
+                                });
+                            })();
+                            </script>
+                            """,
+                            height=0,
+                            width=0
+                        )
+                        st.session_state._smartllmops_js_injected = True
             except Exception:
                 pass
             
